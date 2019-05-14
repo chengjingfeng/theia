@@ -24,6 +24,8 @@ import { MessageService } from '@theia/core/lib/common/message-service';
 import { Progress } from '@theia/core/lib/common/message-service-protocol';
 import { Endpoint } from '@theia/core/lib/browser/endpoint';
 
+import throttle = require('lodash.throttle');
+
 const maxChunkSize = 64 * 1024;
 
 export interface FileUploadParams {
@@ -80,11 +82,9 @@ export class FileUploadService {
                 const targetUri = new URI(<string>body.get(FileUploadService.TARGET));
                 const { resolve, reject } = this.deferredUpload;
                 this.deferredUpload = undefined;
-                this.withProgress((progress, token) => {
-                    const context: FileUploadService.Context = { totalSize: 0, entries: [], progress, token };
-                    body.getAll(FileUploadService.UPLOAD).forEach((file: File) => this.indexFile(targetUri, file, context));
-                    return this.doUpload(context);
-                }, this.uploadForm.progress).then(resolve, reject);
+                this.withProgress((progress, token) =>
+                    this.doUpload(targetUri, body, progress, token),
+                    this.uploadForm.progress).then(resolve, reject);
             }
         });
         return { targetInput, fileInput };
@@ -94,11 +94,9 @@ export class FileUploadService {
     async upload(targetUri: string | URI, params: FileUploadParams = {}): Promise<FileUploadResult> {
         const { source } = params;
         if (source) {
-            return this.withProgress(async (progress, token) => {
-                const context: FileUploadService.Context = { totalSize: 0, entries: [], progress, token };
-                await this.indexDataTransfer(new URI(String(targetUri)), source, context);
-                return this.doUpload(context);
-            }, params.progress);
+            return this.withProgress((progress, token) =>
+                this.doUpload(new URI(String(targetUri)), source, progress, token),
+                params.progress);
         }
         this.deferredUpload = new Deferred<FileUploadResult>();
         this.uploadForm.targetInput.value = String(targetUri);
@@ -107,22 +105,35 @@ export class FileUploadService {
         return this.deferredUpload.promise;
     }
 
-    protected async doUpload({ entries, progress, token, totalSize }: FileUploadService.Context): Promise<FileUploadResult> {
+    protected async doUpload(targetUri: URI, source: FileUploadService.Source, progress: Progress, token: CancellationToken): Promise<FileUploadResult> {
         const result: FileUploadResult = { uploaded: [] };
-        if (!entries.length) {
-            return result;
-        }
-        const total = totalSize;
+        let total = 0;
+        let done = 0;
+        let totalFiles = 0;
+        let doneFiles = 0;
+        const reportProgress = throttle(() => progress.report({
+            message: `${doneFiles} out of ${totalFiles}`,
+            work: { done, total }
+        }), 60);
         const deferredUpload = new Deferred<FileUploadResult>();
         const endpoint = new Endpoint({ path: '/file-upload' });
+        const socketOpen = new Deferred<void>();
         const socket = new WebSocket(endpoint.getWebSocketUrl().toString());
-        socket.onerror = deferredUpload.reject;
+        socket.onerror = e => {
+            socketOpen.reject(e);
+            deferredUpload.reject(e);
+        };
         socket.onclose = ({ code, reason }) => deferredUpload.reject(new Error(String(reason || code)));
         socket.onmessage = ({ data }) => {
             const response = JSON.parse(data);
+            if (response.doneFiles) {
+                doneFiles = response.doneFiles;
+                reportProgress();
+                return;
+            }
             if (response.done) {
-                const { done } = response;
-                progress.report({ work: { done, total } });
+                done = response.done;
+                reportProgress();
                 return;
             }
             if (response.ok) {
@@ -134,39 +145,53 @@ export class FileUploadService {
             }
             socket.close();
         };
-        socket.onopen = async () => {
-            try {
-                socket.send(JSON.stringify({ total }));
-                for (const entry of entries) {
-                    const { file } = entry;
-                    let readBytes = 0;
-                    socket.send(JSON.stringify({ uri: entry.uri.toString(), size: file.size }));
-                    if (file.size) {
-                        do {
-                            const fileSlice = await this.readFileSlice(file, readBytes);
-                            checkCancelled(token);
-                            readBytes = fileSlice.read;
-                            socket.send(fileSlice.content);
-                            while (socket.bufferedAmount > maxChunkSize * 2) {
-                                await new Promise(resolve => setTimeout(resolve));
-                                checkCancelled(token);
-                            }
-                        } while (readBytes < file.size);
-                    }
-                }
-            } catch (e) {
-                deferredUpload.reject(e);
-                if (socket.readyState === 1) {
-                    socket.close();
-                }
-            }
-        };
-        token.onCancellationRequested(() => {
-            deferredUpload.reject(cancelled());
+        socket.onopen = () => socketOpen.resolve();
+        const rejectAndClose = (e: Error) => {
+            deferredUpload.reject(e);
             if (socket.readyState === 1) {
                 socket.close();
             }
-        });
+        };
+        token.onCancellationRequested(() => rejectAndClose(cancelled()));
+        try {
+            let queue = Promise.resolve();
+            await this.index(targetUri, source, {
+                token,
+                progress,
+                accept: async ({ uri, file }) => {
+                    total += file.size;
+                    totalFiles++;
+                    reportProgress();
+                    queue = queue.then(async () => {
+                        try {
+                            await socketOpen.promise;
+                            checkCancelled(token);
+                            let readBytes = 0;
+                            socket.send(JSON.stringify({ uri: uri.toString(), size: file.size }));
+                            if (file.size) {
+                                do {
+                                    const fileSlice = await this.readFileSlice(file, readBytes);
+                                    checkCancelled(token);
+                                    readBytes = fileSlice.read;
+                                    socket.send(fileSlice.content);
+                                    while (socket.bufferedAmount > maxChunkSize * 2) {
+                                        await new Promise(resolve => setImmediate(resolve));
+                                        checkCancelled(token);
+                                    }
+                                } while (readBytes < file.size);
+                            }
+                        } catch (e) {
+                            rejectAndClose(e);
+                        }
+                    });
+                }
+            });
+            await queue;
+            await socketOpen.promise;
+            socket.send(JSON.stringify({ ok: true }));
+        } catch (e) {
+            rejectAndClose(e);
+        }
         return deferredUpload.promise;
     }
 
@@ -207,40 +232,53 @@ export class FileUploadService {
         }
     }
 
+    protected async index(targetUri: URI, source: FileUploadService.Source, context: FileUploadService.Context): Promise<void> {
+        if (source instanceof FormData) {
+            await this.indexFormData(targetUri, source, context);
+        } else {
+            await this.indexDataTransfer(targetUri, source, context);
+        }
+    }
+
+    protected async indexFormData(targetUri: URI, formData: FormData, context: FileUploadService.Context): Promise<void> {
+        for (const file of formData.getAll(FileUploadService.UPLOAD)) {
+            if (file instanceof File) {
+                await this.indexFile(targetUri, file, context);
+            }
+        }
+    }
+
     protected async indexDataTransfer(targetUri: URI, dataTransfer: DataTransfer, context: FileUploadService.Context): Promise<void> {
         checkCancelled(context.token);
         if (dataTransfer.items) {
             await this.indexDataTransferItemList(targetUri, dataTransfer.items, context);
         } else {
-            this.indexFileList(targetUri, dataTransfer.files, context);
+            await this.indexFileList(targetUri, dataTransfer.files, context);
         }
     }
 
-    protected indexFileList(targetUri: URI, files: FileList, context: FileUploadService.Context): void {
+    protected async indexFileList(targetUri: URI, files: FileList, context: FileUploadService.Context): Promise<void> {
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
             if (file) {
-                this.indexFile(targetUri, file, context);
+                await this.indexFile(targetUri, file, context);
             }
         }
     }
 
-    protected indexFile(targetUri: URI, file: File, context: FileUploadService.Context): void {
-        context.entries.push({
+    protected async indexFile(targetUri: URI, file: File, context: FileUploadService.Context): Promise<void> {
+        await context.accept({
             uri: targetUri.resolve(file.name),
             file
         });
-        context.totalSize += file.size;
     }
 
     protected async indexDataTransferItemList(targetUri: URI, items: DataTransferItemList, context: FileUploadService.Context): Promise<void> {
         checkCancelled(context.token);
-        const promises: Promise<void>[] = [];
         for (let i = 0; i < items.length; i++) {
             const entry = items[i].webkitGetAsEntry() as WebKitEntry;
-            promises.push(this.indexEntry(targetUri, entry, context));
+            await this.indexEntry(targetUri, entry, context);
         }
-        await Promise.all(promises);
     }
 
     protected async indexEntry(targetUri: URI, entry: WebKitEntry | null, context: FileUploadService.Context): Promise<void> {
@@ -255,27 +293,25 @@ export class FileUploadService {
         }
     }
 
-    protected async indexDirectoryEntry(targetUri: URI, entry: WebKitDirectoryEntry, context: FileUploadService.Context): Promise<void> {
-        checkCancelled(context.token);
-        const newTargetUri = targetUri.resolve(entry.name);
-        const promises: Promise<void>[] = [];
-        await this.readEntries(entry, items => promises.push(this.indexEntries(newTargetUri, items, context)), context);
-        await Promise.all(promises);
-    }
-
     /**
      *  Read all entries within a folder by block of 100 files or folders until the
      *  whole folder has been read.
      */
-    protected async readEntries(entry: WebKitDirectoryEntry, cb: (items: any) => void, context: FileUploadService.Context): Promise<void> {
+    protected async indexDirectoryEntry(targetUri: URI, entry: WebKitDirectoryEntry, context: FileUploadService.Context): Promise<void> {
+        checkCancelled(context.token);
+        const newTargetUri = targetUri.resolve(entry.name);
         return new Promise<void>(async (resolve, reject) => {
             const reader = entry.createReader();
-            const getEntries = () => reader.readEntries(results => {
-                if (!context.token.isCancellationRequested && results && results.length) {
-                    cb(results);
-                    getEntries(); // loop to read all entries
-                } else {
-                    resolve();
+            const getEntries = () => reader.readEntries(async results => {
+                try {
+                    if (!context.token.isCancellationRequested && results && results.length) {
+                        await this.indexEntries(newTargetUri, results, context);
+                        getEntries(); // loop to read all getEntries
+                    } else {
+                        resolve();
+                    }
+                } catch (e) {
+                    reject(e);
                 }
             }, reject);
             getEntries();
@@ -284,20 +320,17 @@ export class FileUploadService {
 
     protected async indexEntries(targetUri: URI, entries: WebKitEntry[], context: FileUploadService.Context): Promise<void> {
         checkCancelled(context.token);
-        const promises: Promise<void>[] = [];
         for (let i = 0; i < entries.length; i++) {
-            promises.push(this.indexEntry(targetUri, entries[i], context));
+            await this.indexEntry(targetUri, entries[i], context);
         }
-        await Promise.all(promises);
     }
 
     protected async indexFileEntry(targetUri: URI, entry: WebKitFileEntry, context: FileUploadService.Context): Promise<void> {
-        await new Promise((resolve, reject) => {
+        await new Promise<void>((resolve, reject) => {
             try {
-                entry.file(file => {
-                    this.indexFile(targetUri, file, context);
-                    resolve();
-                }, reject);
+                entry.file(file =>
+                    this.indexFile(targetUri, file, context).then(resolve, reject)
+                    , reject);
             } catch (e) {
                 reject(e);
             }
@@ -307,6 +340,7 @@ export class FileUploadService {
 }
 
 export namespace FileUploadService {
+    export type Source = FormData | DataTransfer;
     export interface UploadEntry {
         file: File
         uri: URI
@@ -314,8 +348,7 @@ export namespace FileUploadService {
     export interface Context {
         progress: Progress
         token: CancellationToken
-        entries: UploadEntry[]
-        totalSize: number
+        accept: (entry: UploadEntry) => Promise<void>
     }
     export interface Form {
         targetInput: HTMLInputElement

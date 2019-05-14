@@ -31,8 +31,8 @@ export class NodeFileUploadService implements MessagingService.Contribution {
     }
 
     protected handleFileUpload(socket: ws): void {
-        let total = 0;
         let done = 0;
+        let doneFiles = 0;
         let upload: NodeFileUpload | undefined;
         let queue = Promise.resolve();
         socket.on('message', data => queue = queue.then(async () => {
@@ -43,24 +43,22 @@ export class NodeFileUploadService implements MessagingService.Contribution {
                         done += upload.size;
                         await upload.rename();
                         upload = undefined;
+                        doneFiles++;
+                        if (socket.readyState === 1) {
+                            socket.send(JSON.stringify({ doneFiles }));
+                        }
                     }
-                    if (socket.readyState !== 1) {
-                        return;
-                    }
-                    const uploadedBytes = done + (upload ? upload.uploadedBytes : 0);
-                    if (uploadedBytes < total) {
+                    if (socket.readyState === 1) {
+                        const uploadedBytes = done + (upload ? upload.uploadedBytes : 0);
                         socket.send(JSON.stringify({
                             done: uploadedBytes
                         }));
-                    } else {
-                        socket.send(JSON.stringify({ ok: true }));
-                        socket.close();
                     }
                     return;
                 }
                 const request = JSON.parse(data.toString());
-                if (request.total) {
-                    total = request.total;
+                if (request.ok) {
+                    socket.send(JSON.stringify({ ok: true }));
                     return;
                 }
                 if (request.uri) {
@@ -69,6 +67,10 @@ export class NodeFileUploadService implements MessagingService.Contribution {
                     if (!upload.size) {
                         await upload.rename();
                         upload = undefined;
+                        doneFiles++;
+                        if (socket.readyState === 1) {
+                            socket.send(JSON.stringify({ doneFiles }));
+                        }
                     }
                     return;
                 }
